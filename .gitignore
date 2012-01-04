@@ -1,0 +1,15 @@
+*.pyc
+*.vim
+*.swp
+core
+.DS_store
+.Python
+/bin/
+/include/
+/lib/
+/src/
+/man/
+/share/
+/local/
+/build/
+/readline-*.egg/
