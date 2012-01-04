@@ -13,3 +13,5 @@ core
 /local/
 /build/
 /readline-*.egg/
+
+/mining.pkl
