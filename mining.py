@@ -6,12 +6,9 @@ import copy
 
 import sqlite3
 from dateutil.relativedelta import relativedelta
-
 import scb.names
 
-
-DO_IMPORT = False
-DO_EXTRAS = False
+import settings
 
 
 class memoized(object):
@@ -134,7 +131,7 @@ def do_queries(queries):
             raise
 
 
-if DO_IMPORT:
+if settings.DO_IMPORT:
     do_queries(import_schema)
     conn.commit()
 
@@ -467,7 +464,7 @@ extra_schema = [
 c.execute("SELECT * FROM semesters ORDER BY start;")
 semesters = hashes(c.fetchall())
 
-if DO_EXTRAS:
+if settings.DO_EXTRAS:
     do_queries(extra_schema)
     conn.commit()
 
@@ -476,19 +473,45 @@ if DO_EXTRAS:
     conn.commit()
 
 
-import pprint
+from pprint import pprint
+
+
+def transform(base, steps):
+    new = copy.deepcopy(base)
+    for step in steps:
+        new = step(new)
+    return new
+
+
+def dictzip(*dicts):
+    result = dict()
+    dict_keys = []
+    non_dict_keys = []
+    for k, v in dicts[0].items():
+        if isinstance(v, dict):
+            dict_keys.append(k)
+        else:
+            non_dict_keys.append(k)
+            result[k] = []
+    for k in dict_keys:
+        result[k] = dictzip(*[d[k] for d in dicts])
+    for d in dicts:
+        for k in non_dict_keys:
+            result[k].append(d[k])
+    return result
+
+
 for sem in semesters:
-    struct = classes_within(sem.start, sem.end)
-    get_sem_buys = lambda obj: get_buys(obj, sem)
-    for step in [
-            get_gendered,
-            get_sem_buys,
-            get_summed,
-            ]:
-        struct = step(struct)
-    print sem.name
-    pprint.pprint(struct)
-    print ""
+    genders = get_gendered
+    buys = lambda obj: get_buys(obj, sem)
+    sums = get_summed
+    counts = get_counted
+
+    classes = classes_within(sem.start, sem.end)
+    tree1 = transform(classes, (genders, buys, sums))
+    tree2 = transform(classes, (genders, counts))
+    d = dictzip(tree1, tree2)
+    pprint(d)
 
 
 def num(obj):
