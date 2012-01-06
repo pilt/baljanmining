@@ -500,18 +500,43 @@ def dictzip(*dicts):
             result[k].append(d[k])
     return result
 
+metrics = [BUYER, WORKER, ONCALL]
+outs = ['blips.csv', 'people.csv']
+for csv_file in outs:
+    fields = ['semester']
+    for metric in metrics:
+        for gender in [ALL] + GENDERS:
+            fields.append("%s_%s" % (metric, gender))
+    with open(csv_file, 'w') as csv:
+        csv.write('')
+    with open(csv_file, 'a+') as csv:
+        line = ", ".join(map(str, fields))
+        print line
+        csv.write(line + '\n')
 
 for sem in semesters:
     genders = get_gendered
     buys = lambda obj: get_buys(obj, sem)
     sums = get_summed
     counts = get_counted
-
     classes = classes_within(sem.start, sem.end)
-    tree1 = transform(classes, (genders, buys, sums))
-    tree2 = transform(classes, (genders, counts))
-    d = dictzip(tree1, tree2)
-    pprint(d)
+
+    datas = [
+        transform(classes, (genders, buys, sums)),
+        transform(classes, (genders, counts)),
+        ]
+    for csv_file, data in zip(outs, datas):
+        if data[ALL][ALL] == 0:
+            continue
+        fields = []
+        fields.append(sem.name)
+        for metric in metrics:
+            for gender in [ALL] + GENDERS:
+                fields.append(data[metric][gender])
+        with open(csv_file, 'a+') as csv:
+            line = ",".join(map(str, fields))
+            print line
+            csv.write(line + '\n')
 
 
 def num(obj):
