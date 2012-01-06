@@ -1,3 +1,0 @@
-scb
-pysqlite
-python-dateutil
