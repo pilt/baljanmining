@@ -13,5 +13,7 @@ core
 /local/
 /build/
 /readline-*.egg/
+/pysqlite2-doc/
 
 /mining.pkl
+/mining.sqlite
