@@ -1,4 +1,5 @@
 import cPickle as pickle
+from operator import attrgetter
 import time
 import datetime
 import functools
@@ -37,16 +38,27 @@ class memoized(object):
       """Support instance methods."""
       return functools.partial(self.__call__, obj)
 
+
+def db_type(k):
+    return {
+        int: 'INTEGER', 
+        float: 'FLOAT',
+        }.get(k)
+
+
 WORKER = 'worker'
 ONCALL = 'oncall'
 SIGNUP = 'signup'
 BUYER = 'buyer'
+CUSTOMER = 'customer'
 ALL = 'all'
 MALE = 'male'
 FEMALE = 'female'
 UNKNOWN = 'unknown'
 GENDERS = [MALE, FEMALE, UNKNOWN]
-CLASSES = [WORKER, ONCALL, SIGNUP, BUYER, ALL] + GENDERS
+CLASSES = [WORKER, ONCALL, SIGNUP, BUYER, CUSTOMER] + GENDERS
+
+CUP_LITERS = 0.237
 
 
 @memoized
@@ -75,7 +87,7 @@ import_schema = [
         )""",
     "DROP TABLE IF EXISTS classes;",
     """CREATE TABLE classes (
-        key CHARACTER VARYING(20) PRIMARY KEY,
+        id CHARACTER VARYING(20) PRIMARY KEY,
         name CHARACTER VARYING(20)
         )""",
     "DROP TABLE IF EXISTS users;",
@@ -120,7 +132,7 @@ import_schema = [
     ]
 for g in CLASSES:
     import_schema.append(
-        """INSERT INTO classes (key, name) VALUES ("%s", "%s");""" % (g, g))
+        """INSERT INTO classes (id, name) VALUES ("%s", "%s");""" % (g, g))
 
 def do_queries(queries):
     for query in queries:
@@ -129,96 +141,37 @@ def do_queries(queries):
         except sqlite3.OperationalError:
             print query
             raise
-
-
-if settings.DO_IMPORT:
-    do_queries(import_schema)
     conn.commit()
 
-    name_gender = {}
-    male_names = scb.names.male()
-    female_names = scb.names.female()
-    for names, gender in [(male_names, MALE), (female_names, FEMALE)]:
-        for name in names:
-            name_gender[name] = gender
 
-    with open('mining.pkl', 'rb') as f:
-        d = pickle.load(f)
-    del f
-
-    for sec in d['sections']:
-        c.execute("INSERT INTO sections (name) VALUES (?)", (sec,))
-    conn.commit()
-
-    for uid in d['users']:
-        name = d['user_name'][uid]
-        gender = name_gender.get(name, UNKNOWN)
-        section = d['user_section'][uid]
-        c.execute(
-            """INSERT INTO users 
-                (id, name, gender, section)
-                VALUES (?, ?, ?, ?)
-                """, 
-            (uid, name, gender, section))
-    conn.commit()
-
-    buy_args = []
-    for user, buys in d['user_orders'].items():
-        buy_args.extend((put_at, user) for put_at in buys)
-    c.executemany(
-        """INSERT INTO buys 
-            (put_at, user)
-            VALUES (?, ?)
-            """, 
-        buy_args)
-    conn.commit()
-
-    for sem in d['semesters']:
-        name = d['semester_name'][sem]
-        start, end = d['semester_startend'][sem]
-        c.execute(
-            """INSERT INTO semesters 
-                (id, name, start, end)
-                VALUES (?, ?, ?, ?)
-                """, 
-            (sem, name, start, end))
-    conn.commit()
-
-    for shift in d['shifts']:
-        date = d['shift_date'][shift]
-        span = d['shift_span'][shift]
-        sem = d['shift_semester'][shift]
-        c.execute(
-            """INSERT INTO shifts 
-                (id, date, span, semester)
-                VALUES (?, ?, ?, ?)
-                """, 
-            (shift, date, span, sem))
-    conn.commit()
-
-    signup_args = []
-    for signup_key, signup_class in [
-            ('user_workshifts', WORKER),
-            ('user_oncallshifts', ONCALL)]:
-        for user, shifts in d[signup_key].items():
-            signup_args.extend([(shift, user, signup_class) for shift in shifts])
-    c.executemany(
-        """INSERT INTO signups
-            (shift, user, klass)
-            VALUES (?, ?, ?)
-            """,
-        signup_args)
-    conn.commit()
+class HashError(Exception):
+    pass
 
 
 class Hash(object):
 
     def __init__(self, row):
+        if row is None:
+            raise HashError(row)
+        self.cols = []
+        self.values = []
         for idx, col in enumerate(row.keys()):
+            self.cols.append(col)
+            self.values.append(row[idx])
             setattr(self, col, row[idx])
+        self.items = zip(self.cols, self.values)
 
     def __str__(self):
         return str(self.__dict__)
+
+    def __repr__(self):
+        return repr(self.__dict__)
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __int__(self):
+        return self.id
 
 
 def hashes(res):
@@ -226,16 +179,21 @@ def hashes(res):
 
 
 @memoized
-def get_interval(start, end):
+def get_interval(interval):
     c.execute(
         "SELECT * FROM intervals WHERE start = ? AND end = ? LIMIT 1",
-        (start, end))
+        (interval,))
     return Hash(c.fetchone())
 
 
 @memoized
-def buys_within(start, end):
-    interval = get_interval(start, end)
+def get_intervals():
+    c.execute("SELECT * FROM intervals ORDER BY start")
+    return hashes(c.fetchall())
+
+
+@memoized
+def buys_within(interval):
     c.execute(
         "SELECT * FROM interval_buys WHERE interval = ?;",
         (interval.id,))
@@ -243,8 +201,7 @@ def buys_within(start, end):
 
 
 @memoized
-def user_buys_within(user, start, end):
-    interval = get_interval(start, end)
+def user_buys_within(interval, user):
     c.execute(
         """SELECT count(*) as count FROM interval_buys
             WHERE interval = ? AND user = ?;""",
@@ -253,8 +210,7 @@ def user_buys_within(user, start, end):
 
 
 @memoized
-def shifts_within(start, end):
-    interval = get_interval(start, end)
+def shifts_within(interval):
     c.execute(
         "SELECT * FROM interval_shifts WHERE interval = ?;""",
         (interval.id,))
@@ -262,8 +218,7 @@ def shifts_within(start, end):
 
 
 @memoized
-def signups_within(start, end, g=None):
-    interval = get_interval(start, end)
+def signups_within(interval, g=None):
     extra = ""
     args = [interval.id,]
     if g in [WORKER, ONCALL]:
@@ -276,10 +231,13 @@ def signups_within(start, end, g=None):
 
 
 @memoized
-def get_users(iterable):
+def get_users(iterable, get_set=False):
     user_ids = set()
     for i in iterable:
-        user_ids.add(str(i.user))
+        if isinstance(i, int):
+            user_ids.add(str(i))
+        else:
+            user_ids.add(str(i.user))
     c.execute(
         "SELECT * FROM users WHERE id IN (%s);" % ", ".join(user_ids))
     return hashes(c.fetchall())
@@ -292,28 +250,36 @@ def with_gender(gender, users):
 
 
 @memoized
-def class_within(g, start, end):
+def class_within(interval, g):
     if g in [WORKER, ONCALL]:
-        return get_users(signups_within(start, end, g))
+        return get_users(signups_within(interval, g))
     elif g == SIGNUP:
-        return get_users(signups_within(start, end))
+        return get_users(signups_within(interval))
     elif g == BUYER:
-        return get_users(buys_within(start, end))
+        return get_users(buys_within(interval))
+    elif g == CUSTOMER:
+        getter = attrgetter('user')
+        def get_set(func):
+            return set(map(getter, func(interval)))
+        buyers = get_set(buys_within)
+        signups = get_set(signups_within)
+        customers = buyers.difference(signups)
+        return get_users(customers)
     elif g == ALL:
         iterable = []
-        iterable.extend(signups_within(start, end))
-        iterable.extend(buys_within(start, end))
+        iterable.extend(signups_within(interval))
+        iterable.extend(buys_within(interval))
         return get_users(iterable)
     elif g in GENDERS:
-        return with_gender(g, class_within(ALL, start, end))
+        return with_gender(g, class_within(interval, ALL))
     assert False, g
 
 
 @memoized
-def classes_within(start, end):
+def classes_within(interval):
     classes = {}
-    for g in CLASSES:
-        classes[g] = class_within(g, start, end)
+    for g in AGG_CLASSES:
+        classes[g] = class_within(interval, g)
     return classes
 
 
@@ -338,37 +304,24 @@ def _gender_node(obj):
     new[ALL] = obj
     return new
 def _gender_test(key):
-    return key not in GENDERS
-def get_gendered(obj):
+    return key not in [ALL] + GENDERS
+def get_gendered(interval, obj):
     return traverse(obj, _gender_node, _gender_test)
 
 
 @memoized
 def _interval_buy_node(interval, users):
-    return [user_buys_within(user, interval.start, interval.end) for user in users]
-def get_buys(obj, interval):
+    return [user_buys_within(interval, user) for user in users]
+def get_buys(interval, obj):
     func = functools.partial(_interval_buy_node, interval)
     return traverse(obj, func)
 
 
-@memoized
-def format_counts(obj, indent=0):
-    s = ""
-    i = " " * indent
-    if isinstance(obj, dict):
-        for key, val in obj.items():
-            s += i + str(key) + '\n' + format_counts(val, indent+2)
-    else:
-        count = len(obj)
-        s += i + str(count) + '\n'
-    return s
-
-
-def get_counted(obj):
+def get_counted(interval, obj):
     return traverse(obj, len)
 
 
-def get_summed(obj):
+def get_summed(interval, obj):
     return traverse(obj, sum)
 
 
@@ -461,26 +414,22 @@ extra_schema = [
     """CREATE INDEX i_buy_count_user_idx ON interval_buy_counts(user)""",
     ]
 
-c.execute("SELECT * FROM semesters ORDER BY start;")
-semesters = hashes(c.fetchall())
 
-if settings.DO_EXTRAS:
-    do_queries(extra_schema)
-    conn.commit()
-
-    for sem in semesters:
-        insert_interval(sem.name, sem.start, sem.end)
-    conn.commit()
+def transform(interval, base, steps):
+    if steps:
+        return transform(interval, steps[0](interval, base), steps[1:])
+    return base
 
 
-from pprint import pprint
-
-
-def transform(base, steps):
-    new = copy.deepcopy(base)
-    for step in steps:
-        new = step(new)
-    return new
+@memoized
+def get_metric(interval, metric, klass, gender):
+    c.execute(
+        """SELECT * FROM %(db_plural)s WHERE 
+            interval = ? AND 
+            klass = ? AND
+            gender = ? LIMIT 1""" % get_metric_context(metric),
+        (interval.id, klass, gender))
+    return Hash(c.fetchone())
 
 
 def dictzip(*dicts):
@@ -500,43 +449,146 @@ def dictzip(*dicts):
             result[k].append(d[k])
     return result
 
-metrics = [BUYER, WORKER, ONCALL]
-outs = ['blips.csv', 'people.csv']
-for csv_file in outs:
-    fields = ['semester']
-    for metric in metrics:
-        for gender in [ALL] + GENDERS:
-            fields.append("%s_%s" % (metric, gender))
-    with open(csv_file, 'w') as csv:
-        csv.write('')
-    with open(csv_file, 'a+') as csv:
-        line = ", ".join(map(str, fields))
-        print line
-        csv.write(line + '\n')
 
-for sem in semesters:
-    genders = get_gendered
-    buys = lambda obj: get_buys(obj, sem)
-    sums = get_summed
-    counts = get_counted
-    classes = classes_within(sem.start, sem.end)
+AGG_CLASSES = [CUSTOMER, WORKER]
+METRICS = {
+    'buys': {
+        'py_type': int,
+        'basic': True,
+        'transforms': (get_buys, get_summed),
+        },
+    'people': {
+        'py_type': int,
+        'basic': True,
+        'transforms': (get_counted,),
+        },
+    'buys_per_person': {
+        'py_type': float,
+        'basic': False,
+        },
+    'liters': {
+        'py_type': float,
+        'basic': False,
+        },
+    'liters_per_person': {
+        'py_type': float,
+        'basic': False,
+        },
+    }
 
-    datas = [
-        transform(classes, (genders, buys, sums)),
-        transform(classes, (genders, counts)),
-        ]
-    for csv_file, data in zip(outs, datas):
-        if data[ALL][ALL] == 0:
+
+def get_metrics(metric_type=False):
+    metric_hashes = []
+    for metric, meta in METRICS.items():
+        if metric_type and metric != metric_type:
             continue
-        fields = []
-        fields.append(sem.name)
-        for metric in metrics:
-            for gender in [ALL] + GENDERS:
-                fields.append(data[metric][gender])
-        with open(csv_file, 'a+') as csv:
-            line = ",".join(map(str, fields))
-            print line
-            csv.write(line + '\n')
+        context = get_metric_context(metric)
+        c.execute("SELECT * FROM %(db_plural)s ORDER BY id" % context)
+        metric_hashes.extend(hashes(c.fetchall()))
+    return metric_hashes
+
+
+def clear_metrics(metric_type=False):
+    for metric, meta in METRICS.items():
+        if metric_type and metric != metric_type:
+            continue
+        context = get_metric_context(metric)
+        c.execute("DELETE FROM %(db_plural)s" % context)
+
+
+def get_metric_context(metric):
+    meta = METRICS[metric]
+    return dict(
+        db_singular='metric_%s' % metric,
+        db_plural='metric_%ss' % metric,
+        py_type=meta['py_type'],
+        db_type=db_type(meta['py_type']),
+        )
+
+
+def get_metric_schema(metric):
+    templates = [
+        "DROP TABLE IF EXISTS %(db_plural)s;",
+        """CREATE TABLE %(db_plural)s (
+            id INTEGER PRIMARY KEY,
+            interval INTEGER REFERENCES intervals,
+            klass CHARACTER VARYING(20) REFERENCES classes,
+            gender CHARACTER VARYING(20) DEFAULT "u",
+            value %(db_type)s
+            )""",
+        """CREATE INDEX %(db_plural)s_interval_idx ON %(db_plural)s(interval)""",
+        """CREATE INDEX %(db_plural)s_klass_idx ON %(db_plural)s(klass)""",
+    ]
+    return [template % get_metric_context(metric) for template in templates]
+
+
+def insert_metric(interval, metric, klass, gender, value, commit=True):
+    sql = """INSERT INTO %(db_plural)s
+        (interval, klass, gender, value)
+        VALUES (?, ?, ?, ?);""" % get_metric_context(metric)
+    c.execute(sql, (int(interval), klass, gender, value))
+    if commit:
+        conn.commit()
+
+
+def do_basic_metrics():
+    basic_metrics = [metric for metric, meta in METRICS.items() if meta['basic']]
+    for metric in basic_metrics:
+        intervals = get_intervals()
+        meta = METRICS[metric]
+        for interval in intervals:
+            gendered = get_gendered(interval, classes_within(interval))
+            data = transform(interval, copy.deepcopy(gendered), meta['transforms'])
+            for klass in AGG_CLASSES:
+                for gender in [ALL] + GENDERS:
+                    args = (
+                        interval, 
+                        metric, 
+                        klass, 
+                        gender, 
+                        data[klass][gender],
+                        )
+                    insert_metric(*args, commit=False)
+    conn.commit()
+
+
+def do_extra_metrics():
+    buys = get_metrics('buys')
+    people = get_metrics('people')
+
+    clear_metrics('buys_per_person')
+    for b, p in zip(buys, people):
+        mean = float(b.value) / max(1.0, p.value)
+        insert_metric(
+            b.interval, 
+            'buys_per_person', 
+            b.klass, 
+            b.gender, 
+            mean, commit=False,
+            )
+    buys_per_person = get_metrics('buys_per_person')
+
+    clear_metrics('liters')
+    for b in buys:
+        insert_metric(
+            b.interval, 
+            'liters', 
+            b.klass, 
+            b.gender, 
+            b.value * CUP_LITERS, commit=False,
+            )
+
+    clear_metrics('liters_per_person')
+    for bpp in buys_per_person:
+        insert_metric(
+            bpp.interval, 
+            'liters_per_person', 
+            bpp.klass, 
+            bpp.gender, 
+            bpp.value * CUP_LITERS, commit=False,
+            )
+
+    conn.commit()
 
 
 def num(obj):
@@ -558,3 +610,141 @@ def formatpc(obj, pool):
     else:
         s = "%.2f%%" % (100.0 * r)
         return s.rjust(pad)
+
+
+def get_semesters():
+    c.execute("SELECT * FROM semesters ORDER BY start;")
+    return hashes(c.fetchall())
+
+
+def main():
+    if settings.DO_IMPORT:
+        do_queries(import_schema)
+
+        name_gender = {}
+        male_names = scb.names.male()
+        female_names = scb.names.female()
+        for names, gender in [(male_names, MALE), (female_names, FEMALE)]:
+            for name in names:
+                name_gender[name] = gender
+
+        with open('mining.pkl', 'rb') as f:
+            d = pickle.load(f)
+        del f
+
+        for sec in d['sections']:
+            c.execute("INSERT INTO sections (name) VALUES (?)", (sec,))
+        conn.commit()
+
+        for uid in d['users']:
+            name = d['user_name'][uid]
+            gender = name_gender.get(name, UNKNOWN)
+            section = d['user_section'][uid]
+            c.execute(
+                """INSERT INTO users 
+                    (id, name, gender, section)
+                    VALUES (?, ?, ?, ?)
+                    """, 
+                (uid, name, gender, section))
+        conn.commit()
+
+        buy_args = []
+        for user, buys in d['user_orders'].items():
+            buy_args.extend((put_at, user) for put_at in buys)
+        c.executemany(
+            """INSERT INTO buys 
+                (put_at, user)
+                VALUES (?, ?)
+                """, 
+            buy_args)
+        conn.commit()
+
+        for sem in d['semesters']:
+            name = d['semester_name'][sem]
+            start, end = d['semester_startend'][sem]
+            c.execute(
+                """INSERT INTO semesters 
+                    (id, name, start, end)
+                    VALUES (?, ?, ?, ?)
+                    """, 
+                (sem, name, start, end))
+        conn.commit()
+
+        for shift in d['shifts']:
+            date = d['shift_date'][shift]
+            span = d['shift_span'][shift]
+            sem = d['shift_semester'][shift]
+            c.execute(
+                """INSERT INTO shifts 
+                    (id, date, span, semester)
+                    VALUES (?, ?, ?, ?)
+                    """, 
+                (shift, date, span, sem))
+        conn.commit()
+
+        signup_args = []
+        for signup_key, signup_class in [
+                ('user_workshifts', WORKER),
+                ('user_oncallshifts', ONCALL)]:
+            for user, shifts in d[signup_key].items():
+                signup_args.extend([(shift, user, signup_class) for shift in shifts])
+        c.executemany(
+            """INSERT INTO signups
+                (shift, user, klass)
+                VALUES (?, ?, ?)
+                """,
+            signup_args)
+        conn.commit()
+
+    if settings.DO_EXTRAS:
+        do_queries(extra_schema)
+
+        for sem in get_semesters():
+            insert_interval(sem.name, sem.start, sem.end)
+        conn.commit()
+
+    basic_metrics = [metric for metric, meta in METRICS.items() if meta['basic']]
+    if settings.DO_BASIC_METRICS:
+        for metric in basic_metrics:
+            do_queries(get_metric_schema(metric))
+        do_basic_metrics()
+    extra_metrics = [metric for metric, meta in METRICS.items() if not meta['basic']]
+    if settings.DO_EXTRA_METRICS:
+        for metric in extra_metrics:
+            do_queries(get_metric_schema(metric))
+        do_extra_metrics()
+
+    if settings.DO_CSV:
+        for metric, meta in METRICS.items():
+            csv_file = "%s.csv" % metric
+            fields = ['interval']
+            lookups = []
+            for klass in AGG_CLASSES:
+                for gender in [ALL, MALE, FEMALE]:
+                    lookups.append((klass, gender))
+                    fields.append("%s_%s" % (klass, gender))
+            with open(csv_file, 'w') as csv:
+                line = ", ".join(map(str, fields))
+                csv.write(line + '\n')
+            for interval in get_intervals():
+                try:
+                    values = []
+                    for lookup in lookups:
+                        values.append(get_metric(interval, metric, *lookup).value)
+                    total = sum(values)
+                    if total == 0:
+                        continue
+                    if metric == 'buys' and total < 500:
+                        continue
+                    if metric == 'people' and total < 250:
+                        continue
+                    line = ",".join(map(str, [interval.name] + values))
+                    with open(csv_file, 'a+') as csv:
+                        csv.write(line + '\n')
+                except HashError:
+                    pass
+
+
+
+if __name__ == '__main__':
+    main()
